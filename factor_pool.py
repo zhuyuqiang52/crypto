@@ -32,24 +32,32 @@ class FactorPool:
         
         # Preprocessing
         for df in [self.btc_data, self.eth_data]:
-            df['datetime'] = pd.to_datetime(df['timestamp'], unit='s', utc=True)
+            df['datetime'] = pd.to_datetime(df['Timestamp'], unit='s', utc=True)
             df['datetime_et'] = df['datetime'].dt.tz_convert('America/New_York')
         
-        self.btc_data = self.btc_data[self.btc_data['datetime_et'] >= '2024-01-01'].copy()
-        self.eth_data = self.eth_data[self.eth_data['datetime_et'] >= '2024-01-01'].copy()
+        self.btc_data = self.btc_data[self.btc_data['datetime_et'] >= '2021-01-01'].copy()
+        self.eth_data = self.eth_data[self.eth_data['datetime_et'] >= '2021-01-01'].copy()
 
     def get_hourly_data(self):
         """Get hourly resampled data for BTC and ETH."""
         if self.btc_data is None or self.eth_data is None:
             raise ValueError("Data not loaded. Please call load_data() first.")
 
+        btc_hourly_open = self.btc_data.set_index('datetime_et')['open'].resample('H').first().rename('btc_hour_open')
+        btc_hourly_high = self.btc_data.set_index('datetime_et')['high'].resample('H').max().rename('btc_hour_high')
+        btc_hourly_low = self.btc_data.set_index('datetime_et')['low'].resample('H').min().rename('btc_hour_low')
         btc_hourly_close = self.btc_data.set_index('datetime_et')['close'].resample('H').last().rename('btc_hour_close')
-        eth_hourly_close = self.eth_data.set_index('datetime_et')['close'].resample('H').last().rename('eth_hour_close')
-        
         btc_hourly_volume = self.btc_data.set_index('datetime_et')['volume'].resample('H').sum().rename('btc_hour_volume')
         
-        hourly_data = pd.concat([btc_hourly_close, eth_hourly_close, btc_hourly_volume], axis=1).dropna()
-        hourly_data.rename(columns={'btc_hour_close': 'Close', 'btc_hour_volume': 'Volume'}, inplace=True)
+        eth_hourly_close = self.eth_data.set_index('datetime_et')['close'].resample('H').last().rename('eth_hour_close')
+        
+        hourly_data = pd.concat([
+            btc_hourly_open, btc_hourly_high, btc_hourly_low, btc_hourly_close, 
+            btc_hourly_volume, eth_hourly_close
+        ], axis=1).dropna()
+        hourly_data.rename(columns={
+            'btc_hour_open': 'Open', 'btc_hour_high': 'High', 'btc_hour_low': 'Low', 
+            'btc_hour_close': 'Close', 'btc_hour_volume': 'Volume'}, inplace=True)
         return hourly_data
 
     def compute_all(self):
@@ -69,7 +77,7 @@ class FactorPool:
         fut_24h_ret_ser = results_df['hour_close'].shift(-24) / results_df['hour_close'] - 1
         results_df = pd.concat([results_df, fut_1h_ret_ser.rename('fut_1h_ret'), fut_12h_ret_ser.rename('fut_12h_ret'), fut_24h_ret_ser.rename('fut_24h_ret')], axis=1)
         results_df.ffill(axis=0, inplace=True)
-        return results.corr().iloc[:,-3:]
+        return results_df.corr().iloc[:,-3:]
 
     
        
@@ -89,6 +97,21 @@ if __name__ == '__main__':
     pool.add_factor(RSI())
     pool.add_factor(BTCETH24hCorrelation())
     pool.add_factor(BTCETHIntraHourCorrelation(pool.btc_data, pool.eth_data))
+    pool.add_factor(IntraHourVolatility(pool.btc_data))
+    pool.add_factor(IntraHourVWAP(pool.btc_data))
+    pool.add_factor(IntraHourHighLowRange(pool.btc_data))
+    pool.add_factor(IntraHourVolumeSpike(pool.btc_data))
+    pool.add_factor(IntraHourPriceVolumeTrend(pool.btc_data))
+    pool.add_factor(HourlyReturn())
+    pool.add_factor(MACD())
+    pool.add_factor(BollingerBandsWidth())
+    pool.add_factor(Alpha1())
+    pool.add_factor(Alpha101())
+    pool.add_factor(ADX())
+    pool.add_factor(FisherTransform())
+    pool.add_factor(PercentageATR())
+    pool.add_factor(MoneyFlowIndex())
+    pool.add_factor(HilbertTransformPhase())
 
     results = pool.compute_all()
     print(results.head())
@@ -281,3 +304,271 @@ class CorrelationZScore(Factor):
         corr_series = self.corr_factor.compute(df)
         return (corr_series - corr_series.rolling(self.window).mean()) / corr_series.rolling(self.window).std()
 
+class IntraHourVolatility(Factor):
+    """
+    Standard deviation of minute returns within the hour.
+    """
+    def __init__(self, minute_data):
+        super().__init__('intra_hour_volatility', 'Standard deviation of minute returns within the hour')
+        self.minute_data = minute_data.set_index('datetime_et')
+
+    def compute(self, df):
+        min_ret = self.minute_data['close'].pct_change()
+        return min_ret.resample('H').std().rename(self.name)
+
+class IntraHourVWAP(Factor):
+    """
+    Volume Weighted Average Price (VWAP) within the hour.
+    """
+    def __init__(self, minute_data):
+        super().__init__('intra_hour_vwap', 'Volume weighted average price within the hour')
+        self.minute_data = minute_data.set_index('datetime_et')
+
+    def compute(self, df):
+        pv = self.minute_data['close'] * self.minute_data['volume']
+        v = self.minute_data['volume']
+        vwap = pv.resample('H').sum() / (v.resample('H').sum() + 1e-8)
+        return vwap.rename(self.name)
+
+class IntraHourHighLowRange(Factor):
+    """
+    High-Low range within the hour normalized by the opening price.
+    """
+    def __init__(self, minute_data):
+        super().__init__('intra_hour_hl_range', 'High-Low range within the hour relative to open')
+        self.minute_data = minute_data.set_index('datetime_et')
+
+    def compute(self, df):
+        h = self.minute_data['high'].resample('H').max()
+        l = self.minute_data['low'].resample('H').min()
+        o = self.minute_data['open'].resample('H').first()
+        return ((h - l) / o).rename(self.name)
+
+class IntraHourVolumeSpike(Factor):
+    """
+    Ratio of the maximum minute volume to the average minute volume within the hour.
+    """
+    def __init__(self, minute_data):
+        super().__init__('intra_hour_vol_spike', 'Ratio of max minute volume to mean minute volume in the hour')
+        self.minute_data = minute_data.set_index('datetime_et')
+
+    def compute(self, df):
+        v = self.minute_data['volume']
+        return (v.resample('H').max() / (v.resample('H').mean() + 1e-8)).rename(self.name)
+
+class IntraHourPriceVolumeTrend(Factor):
+    """
+    Inspired by Alpha 101 (e.g., Alpha 12).
+    Intra-hour sum of sign(delta(volume)) * (-delta(close)).
+    """
+    def __init__(self, minute_data):
+        super().__init__('intra_hour_pv_trend', 'Intra-hour sum of sign(delta(volume)) * (-delta(close))')
+        self.minute_data = minute_data.set_index('datetime_et')
+
+    def compute(self, df):
+        delta_v = self.minute_data['volume'].diff()
+        delta_c = self.minute_data['close'].diff()
+        pv_trend = (np.sign(delta_v) * -delta_c).resample('H').sum()
+        return pv_trend.rename(self.name)
+
+class HourlyReturn(Factor):
+    """
+    Raw hourly close-to-close return.
+    """
+    def __init__(self):
+        super().__init__('hourly_return', 'Hourly close-to-close return')
+
+    def compute(self, df):
+        return df['Close'].pct_change().rename(self.name)
+
+class MACD(Factor):
+    """
+    Moving Average Convergence Divergence (MACD) on the hourly close price.
+    """
+    def __init__(self, fast=12, slow=26, signal=9):
+        super().__init__(f'macd_{fast}_{slow}_{signal}', 'MACD indicator')
+        self.fast = fast
+        self.slow = slow
+        self.signal = signal
+
+    def compute(self, df):
+        ema_fast = df['Close'].ewm(span=self.fast, adjust=False).mean()
+        ema_slow = df['Close'].ewm(span=self.slow, adjust=False).mean()
+        macd = ema_fast - ema_slow
+        return macd.rename(self.name)
+
+class BollingerBandsWidth(Factor):
+    """
+    Bollinger Bands width on the hourly close price.
+    """
+    def __init__(self, window=20, num_std=2):
+        super().__init__(f'bb_width_{window}', 'Bollinger Bands Width')
+        self.window = window
+        self.num_std = num_std
+
+    def compute(self, df):
+        rolling_mean = df['Close'].rolling(window=self.window).mean()
+        rolling_std = df['Close'].rolling(window=self.window).std()
+        upper_band = rolling_mean + (rolling_std * self.num_std)
+        lower_band = rolling_mean - (rolling_std * self.num_std)
+        return ((upper_band - lower_band) / rolling_mean).rename(self.name)
+
+class Alpha1(Factor):
+    """
+    WorldQuant Alpha 1 (Adapted for single asset).
+    Formula: rank(Ts_ArgMax(SignedPower(((returns < 0) ? stddev(returns, 20) : close), 2.), 5)) - 0.5
+    """
+    def __init__(self):
+        super().__init__('alpha_1', 'WorldQuant Alpha 1')
+
+    def compute(self, df):
+        ret = df['Close'].pct_change()
+        stddev = ret.rolling(20).std()
+        cond = ret < 0
+        
+        val = np.where(cond, stddev, df['Close'])
+        signed_power = np.sign(val) * (np.abs(val) ** 2)
+        
+        # Ts_ArgMax over 5 periods (returns 1 to 5)
+        ts_argmax = pd.Series(signed_power, index=df.index).rolling(5).apply(lambda x: np.argmax(x) + 1, raw=True)
+        
+        # Scaling to [-0.5, 0.5] as a substitute for cross-sectional rank
+        return (ts_argmax / 5.0 - 0.5).rename(self.name)
+
+class Alpha101(Factor):
+    """
+    WorldQuant Alpha 101.
+    Formula: ((close - open) / ((high - low) + .001))
+    """
+    def __init__(self):
+        super().__init__('alpha_101', 'WorldQuant Alpha 101')
+
+    def compute(self, df):
+        return ((df['Close'] - df['Open']) / ((df['High'] - df['Low']) + 0.001)).rename(self.name)
+
+class ADX(Factor):
+    """
+    Average Directional Index (ADX).
+    Measures trend strength.
+    """
+    def __init__(self, window=14):
+        super().__init__(f'adx_{window}', 'Average Directional Index')
+        self.window = window
+
+    def compute(self, df):
+        high = df['High']
+        low = df['Low']
+        close = df['Close']
+        
+        tr1 = high - low
+        tr2 = (high - close.shift(1)).abs()
+        tr3 = (low - close.shift(1)).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        
+        up_move = high - high.shift(1)
+        down_move = low.shift(1) - low
+        
+        pos_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
+        neg_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
+        
+        pos_dm = pd.Series(pos_dm, index=df.index)
+        neg_dm = pd.Series(neg_dm, index=df.index)
+        
+        atr = tr.ewm(alpha=1/self.window, adjust=False).mean()
+        pos_di = 100 * pos_dm.ewm(alpha=1/self.window, adjust=False).mean() / atr
+        neg_di = 100 * neg_dm.ewm(alpha=1/self.window, adjust=False).mean() / atr
+        
+        dx = 100 * (pos_di - neg_di).abs() / (pos_di + neg_di + 1e-8)
+        adx = dx.ewm(alpha=1/self.window, adjust=False).mean()
+        
+        return adx.rename(self.name)
+
+class FisherTransform(Factor):
+    """
+    Fisher Transform on price.
+    Transforms price into a Gaussian distribution.
+    """
+    def __init__(self, window=9):
+        super().__init__(f'fisher_transform_{window}', 'Fisher Transform')
+        self.window = window
+
+    def compute(self, df):
+        hl2 = (df['High'] + df['Low']) / 2
+        roll_min = hl2.rolling(window=self.window).min()
+        roll_max = hl2.rolling(window=self.window).max()
+        
+        # Normalize to [-1, 1]
+        x = 2 * ((hl2 - roll_min) / (roll_max - roll_min + 1e-8)) - 1
+        x = x.clip(-0.999, 0.999)
+        
+        fisher = 0.5 * np.log((1 + x) / (1 - x))
+        # Smoothed with previous value
+        fisher = fisher.ewm(alpha=0.5, adjust=False).mean()
+        
+        return fisher.rename(self.name)
+
+class PercentageATR(Factor):
+    """
+    Normalized ATR (ATR / Close) to make it price-agnostic.
+    """
+    def __init__(self, window=14):
+        super().__init__(f'natr_{window}', 'Percentage Average True Range')
+        self.window = window
+
+    def compute(self, df):
+        high = df['High']
+        low = df['Low']
+        close = df['Close']
+        
+        tr1 = high - low
+        tr2 = (high - close.shift(1)).abs()
+        tr3 = (low - close.shift(1)).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        
+        atr = tr.ewm(alpha=1/self.window, adjust=False).mean()
+        natr = (atr / close) * 100
+        
+        return natr.rename(self.name)
+
+class MoneyFlowIndex(Factor):
+    """
+    Money Flow Index (MFI).
+    Volume-weighted RSI.
+    """
+    def __init__(self, window=14):
+        super().__init__(f'mfi_{window}', 'Money Flow Index')
+        self.window = window
+
+    def compute(self, df):
+        tp = (df['High'] + df['Low'] + df['Close']) / 3
+        rmf = tp * df['Volume']
+        
+        diff = tp.diff()
+        pos_mf = np.where(diff > 0, rmf, 0)
+        neg_mf = np.where(diff < 0, rmf, 0)
+        
+        pos_mf = pd.Series(pos_mf, index=df.index).rolling(window=self.window).sum()
+        neg_mf = pd.Series(neg_mf, index=df.index).rolling(window=self.window).sum()
+        
+        mfr = pos_mf / (neg_mf + 1e-8)
+        mfi = 100 - (100 / (1 + mfr))
+        
+        return mfi.rename(self.name)
+
+class HilbertTransformPhase(Factor):
+    """
+    Hilbert Transform dominant cycle phase approximation.
+    """
+    def __init__(self, window=24):
+        super().__init__(f'hilbert_phase_{window}', 'Hilbert Transform Phase Approx')
+        self.window = window
+
+    def compute(self, df):
+        # A simple approximation: subtract moving average to center,
+        # then calculate phase using a quarter-cycle delayed signal
+        delay = max(1, self.window // 4)
+        centered = df['Close'] - df['Close'].rolling(window=self.window).mean()
+        hilbert = centered.shift(delay)
+        
+        phase = np.arctan2(hilbert, centered)
+        return phase.rename(self.name)
