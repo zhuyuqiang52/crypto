@@ -86,7 +86,7 @@ def update_crypto_data(df, product_id, file_path):
     if all_new_candles:
         new_df = pd.DataFrame(
             all_new_candles,
-            columns=['timestamp', 'low', 'high', 'open', 'close', 'volume']
+            columns=['Timestamp', 'Low', 'High', 'Open', 'Close', 'Volume']
         )
         print(f"\nFetched a total of {len(new_df)} new candles for {product_id}.")
         old_rows = len(df)
@@ -116,9 +116,9 @@ def update_crypto_data(df, product_id, file_path):
 eth_df = update_crypto_data(eth_df, "ETH-USD", 'data/ethusd_1min_ohlc.csv')
 btc_df = update_crypto_data(btc_df, "BTC-USD", 'data/btcusd_1-min_data.csv')
 # %%
-start_dt = pd.to_datetime("2026-01-10",utc=True)
+start_dt = pd.to_datetime("2025-07-05",utc=True)
 start_dt = start_dt.tz_convert('America/New_York')
-end_dt = pd.to_datetime("2026-01-13",utc=True)
+end_dt = pd.to_datetime("2026-03-13",utc=True)
 end_dt = end_dt.tz_convert('America/New_York')
 tmp_btc_df = btc_df[(btc_df['datetime_et'] >= start_dt) & (btc_df['datetime_et'] <= end_dt)]
 # plot btc volume and price change at two axis
@@ -133,7 +133,7 @@ plt.show()
 # transform timestamp and plot the price
 start_dt = pd.to_datetime("2025-07-05",utc=True)
 start_dt = start_dt.tz_convert('America/New_York')
-end_dt = pd.to_datetime("2025-12-15",utc=True)
+end_dt = pd.to_datetime("2026-03-13",utc=True)
 end_dt = end_dt.tz_convert('America/New_York')
 tmp_eth_df = eth_df[(eth_df['datetime_et'] >= start_dt) & (eth_df['datetime_et'] <= end_dt)]
 # plot btc volume and price change at two axis
